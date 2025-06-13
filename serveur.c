@@ -211,7 +211,6 @@ void handle_timeout_expiry() {
             // Passer au round suivant
             game_state = STATE_ROUND_ENDED;
             stop_timeout();
-            sleep(2);
             start_new_round();
         } else {
             // Passer au joueur suivant
@@ -244,7 +243,6 @@ void handle_timeout_expiry() {
         }
         
     } else if (game_state == STATE_VOTING_PHASE) {
-        // Timeout pendant la phase de vote - terminer le jeu
         printf("Choice timeout expired during voting phase\n");
         
         char alert_msg[BUFFER_SIZE];
@@ -252,16 +250,53 @@ void handle_timeout_expiry() {
                 "/info ALERT:Temps de vote écoulé, fin de partie\n");
         broadcast_message(alert_msg);
         
-        // Marquer la fin de partie
         game_state = STATE_GAME_FINISHED;
         game_end_time = time(NULL);
         
-        // Envoyer les résultats avec les scores actuels
+        // Trouver le VRAI imposteur
+        client_t* real_imposter = NULL;
+        for (client_t* c = clients; c; c = c->next) {
+            if (c->logged_in && c->is_imposter) {
+                real_imposter = c;
+                break;
+            }
+        }
+        
+        // Compter les mauvais votes (ceux qui n'ont pas accusé l'imposteur)
+        int impostor_points = 0;
+        
+        // Attribuer les points
+        for (client_t* c = clients; c; c = c->next) {
+            if (c->logged_in) {
+                if (c == real_imposter) {
+                    c->points_gained = 0; // Initialisation, sera mis à jour après
+                } 
+                else if (real_imposter && strlen(c->accused_login) > 0 && 
+                        strcmp(c->accused_login, real_imposter->login) == 0) {
+                    // Bonne accusation
+                    c->score += 1;
+                    c->points_gained = 1;
+                } else {
+                    // Mauvaise accusation ou pas voté
+                    c->points_gained = 0;
+                    impostor_points++; // L'imposteur gagne 1 point
+                }
+            }
+        }
+        
+        // Donner les points accumulés à l'imposteur
+        if (real_imposter) {
+            real_imposter->score += impostor_points;
+            real_imposter->points_gained = impostor_points;
+        }
+        
+        // Envoyer les résultats
         char result_msg[BUFFER_SIZE] = "/info RESULT:";
         for (client_t* c = clients; c; c = c->next) {
             if (c->logged_in) {
                 char player_result[100];
-                snprintf(player_result, sizeof(player_result), "%s:%d+0:", c->login, c->score);
+                snprintf(player_result, sizeof(player_result), "%s:%d+%d:", 
+                        c->login, c->score - c->points_gained, c->points_gained);
                 strcat(result_msg, player_result);
             }
         }
@@ -269,8 +304,17 @@ void handle_timeout_expiry() {
         strcat(result_msg, "\n");
         broadcast_message(result_msg);
         
-        printf("Game finished due to timeout. Auto-restart scheduled in %d seconds.\n", GAME_RESTART_DELAY);
-
+        // Révéler le vrai imposteur et les mots
+        if (real_imposter) {
+            char answer_msg[BUFFER_SIZE];
+            snprintf(answer_msg, sizeof(answer_msg), 
+                    "/info ANSWER:%s:%s:%s\n", real_imposter->login, 
+                    round_words[current_word_pair_index].imposter_word, 
+                    round_words[current_word_pair_index].word);
+            broadcast_message(answer_msg);
+        }
+        
+        printf("Game finished. Auto-restart in %d seconds.\n", GAME_RESTART_DELAY);
         stop_timeout();
     }
 }
@@ -305,6 +349,7 @@ void reset_game_state() {
     game_state = STATE_WAITING_PLAYERS;
     game_end_time = 0;
     clear_used_words();
+    stop_timeout();
     
     printf("Game state reset. Waiting for players to restart...\n");
 }
@@ -416,6 +461,7 @@ void remove_client(int fd) {
             // Sauvegarde du nom du joueur s'il était loggé
             char login[MAX_LOGIN_LENGTH + 1];
             int was_logged_in = tmp->logged_in;
+            int was_imposter = tmp->is_imposter;
             strncpy(login, tmp->login, MAX_LOGIN_LENGTH);
             login[MAX_LOGIN_LENGTH] = '\0';
 
@@ -426,10 +472,119 @@ void remove_client(int fd) {
             // Envoi du message ALERT si le joueur était loggé
             if (was_logged_in) {
                 char alert_msg[BUFFER_SIZE];
-                snprintf(alert_msg, sizeof(alert_msg), "/info ALERT:Le joueur '%s' a quitté la partie.\n", login);
+                snprintf(alert_msg, sizeof(alert_msg), 
+                        "/info ALERT:Le joueur '%s' a quitté la partie.\n", login);
                 broadcast_message(alert_msg);
 
-                check_disconnection_restart();
+                int logged_in = count_logged_in_players();
+                
+                // Si c'était l'imposteur, relancer la partie immédiatement
+                if (was_imposter && game_state != STATE_WAITING_PLAYERS && game_state != STATE_GAME_FINISHED) {
+                    printf("Imposter left, restarting game...\n");
+                    
+                    // Envoyer un message spécial pour indiquer que l'imposteur a quitté
+                    char impostor_msg[BUFFER_SIZE];
+                    snprintf(impostor_msg, sizeof(impostor_msg), 
+                            "/info ALERT:L'imposteur a quitté! La partie redémarre.\n");
+                    broadcast_message(impostor_msg);
+                    
+                    reset_game_state();
+                    
+                    // Si assez de joueurs, redémarrer immédiatement
+                    if (logged_in >= expected_players) {
+                        game_state = STATE_GAME_STARTED;
+                        assign_words_to_players();
+                        start_new_round();
+                    } else {
+                        // Pas assez de joueurs, attendre de nouvelles connexions
+                        char login_msg[BUFFER_SIZE];
+                        snprintf(login_msg, sizeof(login_msg), "/ret LOGIN:000\n");
+                        broadcast_message(login_msg);
+                        
+                        // Envoyer la liste des joueurs connectés à chacun
+                        for (client_t* c = clients; c; c = c->next) {
+                            if (c->logged_in) {
+                                int tempo = 1;
+                                for (client_t* other = clients; other; other = other->next) {
+                                    if (other->logged_in) {
+                                        char info_msg[BUFFER_SIZE];
+                                        snprintf(info_msg, sizeof(info_msg), "/info LOGIN:%d/%d:%s\n", 
+                                                tempo, expected_players, other->login);
+                                        send_message(c->fd, info_msg);
+                                        tempo++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Si assez de joueurs restants, continuer la partie
+                else if (logged_in >= 3 && game_state != STATE_WAITING_PLAYERS && game_state != STATE_GAME_FINISHED) {
+                    printf("Player left but enough remaining, continuing game...\n");
+                    
+                    // Si c'était le tour du joueur qui a quitté, passer au suivant
+                    if (timeout_client && timeout_client->fd == fd) {
+                        // Marquer ce joueur comme ayant "dit" un mot vide
+                        strcpy(timeout_client->said_word, "Trop_lent");
+                        
+                        char say_msg[BUFFER_SIZE + MAX_LOGIN_LENGTH + 20];
+                        snprintf(say_msg, sizeof(say_msg), "/info SAY:%s:%s\n", timeout_client->login, timeout_client->said_word);
+                        broadcast_message(say_msg);
+                        
+                        // Vérifier si tous les joueurs ont joué
+                        int all_played = 1;
+                        for (client_t* c = clients; c; c = c->next) {
+                            if (c->logged_in && strlen(c->said_word) == 0) {
+                                all_played = 0;
+                                break;
+                            }
+                        }
+                        
+                        if (all_played) {
+                            // Passer au round suivant
+                            game_state = STATE_ROUND_ENDED;
+                            stop_timeout();
+                            start_new_round();
+                        } else {
+                            // Passer au joueur suivant
+                            client_t* next_player = timeout_client->next;
+                            while (next_player && (!next_player->logged_in || strlen(next_player->said_word) > 0)) {
+                                next_player = next_player->next;
+                            }
+                            if (!next_player) {
+                                next_player = clients;
+                                while (next_player && (!next_player->logged_in || strlen(next_player->said_word) > 0)) {
+                                    next_player = next_player->next;
+                                }
+                            }
+                            
+                            if (next_player) {
+                                char wait_msg[BUFFER_SIZE];
+                                snprintf(wait_msg, sizeof(wait_msg), "/info WAIT:%s:PLAY\n", next_player->login);
+                                broadcast_message(wait_msg);
+                                
+                                char play_msg[BUFFER_SIZE];
+                                snprintf(play_msg, sizeof(play_msg), "/play %d\n", play_timeout);
+                                send_message(next_player->fd, play_msg);
+                                
+                                // Mettre à jour le timeout pour le joueur suivant
+                                start_timeout(next_player);
+                            } else {
+                                // Aucun joueur valide trouvé, désactiver le timeout
+                                stop_timeout();
+                            }
+                        }
+                    }
+                } 
+                // Sinon, annuler la partie
+                else if (game_state != STATE_WAITING_PLAYERS && game_state != STATE_GAME_FINISHED) {
+                    printf("Not enough players, resetting game...\n");
+                    reset_game_state();
+                    char login_msg[BUFFER_SIZE];
+                    snprintf(login_msg, sizeof(login_msg), "/ret LOGIN:000\n");
+                    broadcast_message(login_msg);
+                }
+                broadcast_message(alert_msg);
             }
 
             return;
@@ -607,6 +762,11 @@ void handle_play_command(client_t* client, const char* word) {
         return;
     }
 
+    if (strchr(word, ':')) {
+        send_message(client->fd, "/ret PLAY:108\n"); // Nouveau code d'erreur pour caractère interdit
+        return;
+    }
+
     // Si on arrive ici, la commande /play est valide
     send_message(client->fd, "/ret PLAY:000\n");
 
@@ -635,9 +795,6 @@ void handle_play_command(client_t* client, const char* word) {
     if (all_played) {
         // Move to next round
         game_state = STATE_ROUND_ENDED;
-        
-        // Wait a bit before starting next round
-        sleep(2);
         start_new_round();
     } else {
         // Next player's turn
@@ -665,13 +822,13 @@ void handle_choice_command(client_t* client, const char* accused_login) {
         return;
     }
 
-    // Check if accusing self
+    // Vérifie si le joueur s'accuse lui-même
     if (strcmp(accused_login, client->login) == 0) {
         send_message(client->fd, "/ret CHOICE:105\n");
         return;
     }
 
-    // Check if accused player exists
+    // Vérifie si le joueur accusé existe
     client_t* accused = find_client_by_login(accused_login);
     if (!accused) {
         send_message(client->fd, "/ret CHOICE:106\n");
@@ -679,17 +836,13 @@ void handle_choice_command(client_t* client, const char* accused_login) {
     }
 
     strncpy(client->accused_login, accused_login, MAX_LOGIN_LENGTH);
-
-    if (timeout_active) {
-        stop_timeout();
-    }
     
-    // Broadcast the accusation
+    // Diffuse l'accusation à tous
     char choice_msg[BUFFER_SIZE];
     snprintf(choice_msg, sizeof(choice_msg), "/info CHOICE:%s:%s\n", client->login, accused_login);
     broadcast_message(choice_msg);
 
-    // Check if all players have chosen
+    // Vérifie si tous ont voté
     int all_chosen = 1;
     for (client_t* c = clients; c; c = c->next) {
         if (c->logged_in && strlen(c->accused_login) == 0) {
@@ -699,69 +852,70 @@ void handle_choice_command(client_t* client, const char* accused_login) {
     }
 
     if (all_chosen) {
-        // End game and determine final results
+        stop_timeout();
         
-        // Find who was imposter most often
-        int max_imposter_count = 0;
-        client_t* likely_imposter = NULL;
+        // Trouve le vrai imposteur
+        client_t* real_imposter = NULL;
+        for (client_t* c = clients; c; c = c->next) {
+            if (c->logged_in && c->is_imposter) {
+                real_imposter = c;
+                break;
+            }
+        }
         
+        // Calcul des points
+        int impostor_points = 0;
         for (client_t* c = clients; c; c = c->next) {
             if (c->logged_in) {
-                int accusation_count = 0;
-                for (client_t* accuser = clients; accuser; accuser = accuser->next) {
-                    if (accuser->logged_in && strcmp(accuser->accused_login, c->login) == 0) {
-                        accusation_count++;
-                    }
-                }
-                
-                if (accusation_count > max_imposter_count) {
-                    max_imposter_count = accusation_count;
-                    likely_imposter = c;
+                if (c == real_imposter) {
+                    // L'imposteur ne gagne pas de points ici (il gagnera plus bas)
+                    c->points_gained = 0;
+                } else if (real_imposter && strcmp(c->accused_login, real_imposter->login) == 0) {
+                    // Bonne accusation
+                    c->score += 1;
+                    c->points_gained = 1;
+                } else {
+                    // Mauvaise accusation
+                    c->points_gained = 0;
+                    impostor_points++; // L'imposteur gagne 1 point par mauvais vote
                 }
             }
         }
         
-        // Calculate points gained in this round (1 if correctly accused imposter, 0 otherwise)
-        for (client_t* c = clients; c; c = c->next) {
-            if (c->logged_in) {
-                int points_gained = 0;
-                if (likely_imposter && strcmp(c->accused_login, likely_imposter->login) == 0) {
-                    points_gained = 1;
-                    c->score += points_gained;
-                }
-                c->points_gained = points_gained; // Store temporarily for result message
-            }
+        // Attribue les points à l'imposteur
+        if (real_imposter) {
+            real_imposter->score += impostor_points;
+            real_imposter->points_gained = impostor_points;
         }
         
-        // Send final results in the requested format
+        // Envoi des résultats
         char result_msg[BUFFER_SIZE] = "/info RESULT:";
         for (client_t* c = clients; c; c = c->next) {
             if (c->logged_in) {
                 char player_result[100];
-                snprintf(player_result, sizeof(player_result), "%s:%d+%d:", c->login, c->score - c->points_gained, c->points_gained);
+                snprintf(player_result, sizeof(player_result), "%s:%d+%d:", 
+                        c->login, c->score - c->points_gained, c->points_gained);
                 strcat(result_msg, player_result);
             }
         }
-        // Remove last ':' and add newline
         result_msg[strlen(result_msg)-1] = '\0';
         strcat(result_msg, "\n");
         broadcast_message(result_msg);
         
-        // Announce likely imposter and correct words
-        if (likely_imposter) {
-	        char answer_msg[BUFFER_SIZE];
-	        snprintf(answer_msg, sizeof(answer_msg), 
-	                "/info ANSWER:%s:%s:%s\n", likely_imposter->login, 
-	                round_words[current_word_pair_index].imposter_word, 
-	                round_words[current_word_pair_index].word);
-	        broadcast_message(answer_msg);
-	    }
+        // Annonce le vrai imposteur
+        if (real_imposter) {
+            char answer_msg[BUFFER_SIZE];
+            snprintf(answer_msg, sizeof(answer_msg), 
+                    "/info ANSWER:%s:%s:%s\n", real_imposter->login, 
+                    round_words[current_word_pair_index].imposter_word, 
+                    round_words[current_word_pair_index].word);
+            broadcast_message(answer_msg);
+        }
         
-        // Marquer la fin de partie et enregistrer l'heure
         game_state = STATE_GAME_FINISHED;
         game_end_time = time(NULL);
         
-        printf("Game finished. Auto-restart scheduled in %d seconds.\n", GAME_RESTART_DELAY);
+        printf("Game finished. Auto-restart in %d seconds.\n", GAME_RESTART_DELAY);
     }
 }
 
@@ -771,8 +925,13 @@ void handle_login_command(client_t* client, const char* login) {
         return;
     }
 
+    if (game_state != STATE_WAITING_PLAYERS && game_state != STATE_GAME_FINISHED) {
+        send_message(client->fd, "/ret LOGIN:109\n"); // Nouveau code : partie en cours
+        return;
+    }
+
     if (!is_valid_login(login)) {
-        send_message(client->fd, "/ret LOGIN:201\n");
+        send_message(client->fd, "/ret LOGIN:107\n");
         return;
     }
 
@@ -915,7 +1074,7 @@ int main(int argc, char* argv[]) {
             }
 
             int slot_available = -1;
-            for (int i = 1; i <= MAX_CLIENTS; ++i) {
+            for (int i = 1; i <= expected_players; ++i) {
                 if (fds[i].fd < 0) {
                     slot_available = i;
                     break;
