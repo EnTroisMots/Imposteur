@@ -74,5 +74,7 @@ make
 Le client utilise la bibliothèque SDL2 ainsi que SDL2_ttf pour l'affichage graphique. Avant de compiler, vous devez vous assurer que ces bibliothèques sont installées sur votre système.
 
 ## 🔧 Sous Ubuntu
-sudo apt update
-sudo apt install libsdl2-dev libsdl2-ttf-dev
+```bash
+-sudo apt update
+-sudo apt install libsdl2-dev libsdl2-ttf-dev
+```
