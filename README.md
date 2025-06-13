@@ -75,6 +75,6 @@ Le client utilise la bibliothèque SDL2 ainsi que SDL2_ttf pour l'affichage grap
 
 ## 🔧 Sous Ubuntu
 ```bash
--sudo apt update
--sudo apt install libsdl2-dev libsdl2-ttf-dev
+sudo apt update
+sudo apt install libsdl2-dev libsdl2-ttf-dev
 ```
